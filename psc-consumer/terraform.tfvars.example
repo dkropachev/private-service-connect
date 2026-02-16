@@ -13,5 +13,5 @@ dns_domain  = "cluster-1.scylladb.com"
 nodes = [
   { name = "node-0", port = 9001 },
   { name = "node-1", port = 9002 },
-  { name = "node-2", port = 9004 },
+  { name = "node-2", port = 9003 },
 ]

@@ -14,7 +14,7 @@ A client in the consumer VPC connects to the PSC endpoint IP on a node-specific 
 |---------------------|-------------|-----------------------|--------------|
 | 10.138.0.56         | 9001        | node-3 (us-west1-a)  | 9042         |
 | 10.138.0.56         | 9002        | node-4 (us-west1-b)  | 9042         |
-| 10.138.0.56         | 9004        | node-5 (us-west1-c)  | 9042         |
+| 10.138.0.56         | 9003        | node-5 (us-west1-c)  | 9042         |
 
 ## Modules
 
@@ -68,7 +68,7 @@ nodes = [
   },
   {
     instance_self_link = "projects/my-project/zones/us-west1-c/instances/scylla-node-2"
-    client_port        = 9004
+    client_port        = 9003
     backend_port       = 9042
   },
 ]
@@ -93,7 +93,7 @@ dns_domain  = "cluster-1.scylladb.com"
 nodes = [
   { name = "node-0", port = 9001 },
   { name = "node-1", port = 9002 },
-  { name = "node-2", port = 9004 },
+  { name = "node-2", port = 9003 },
 ]
 ```
 
@@ -109,7 +109,7 @@ The current mappings work because each instance has exactly one entry:
 |-------------|------------------|--------------|
 | 9001        | node-3           | 9042         |
 | 9002        | node-4           | 9042         |
-| 9004        | node-5           | 9042         |
+| 9003        | node-5           | 9042         |
 
 Adding round-robin on port 9042 would require three more entries — all of which fail:
 
@@ -129,11 +129,11 @@ Port mapping NEGs are a 1:1 lookup table: `(client_port) → (instance, backend_
 
 | Approach | Trade-off |
 |----------|-----------|
-| **CQL driver with all 3 ports** | Driver connects to 9001, 9002, 9004 directly — most ScyllaDB drivers handle multi-node topology natively. **Recommended.** |
+| **CQL driver with all 3 ports** | Driver connects to 9001, 9002, 9003 directly — most ScyllaDB drivers handle multi-node topology natively. **Recommended.** |
 | **Proxy VM** | HAProxy on a dedicated VM listening on 9042, round-robining to the 3 nodes. Adds a hop and a SPOF. |
 | **Multiple PSC endpoints** | One PSC endpoint per node, each on port 9042. Consumer must create 3 forwarding rules + 3 IPs. |
 | **Second NEG + second PSC** | Separate NEG with `9042→node-X:9042` for one node via a second service attachment. Not true round-robin. |
 
 ### Recommendation
 
-Use the per-node ports (9001, 9002, 9004) as contact points in the CQL driver. The driver discovers the full topology after initial connection and routes queries to the correct node automatically — round-robin on the connection port is unnecessary.
+Use the per-node ports (9001, 9002, 9003) as contact points in the CQL driver. The driver discovers the full topology after initial connection and routes queries to the correct node automatically — round-robin on the connection port is unnecessary.

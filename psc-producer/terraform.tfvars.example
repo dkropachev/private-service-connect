@@ -20,7 +20,7 @@ nodes = [
   },
   {
     instance_self_link = "projects/cx-sa-lab/zones/us-west1-c/instances/scylla-cloud-45344-node-5-48cfe68e3619bfe02cfc"
-    client_port        = 9004
+    client_port        = 9003
     backend_port       = 9042
   },
 ]
