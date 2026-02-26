@@ -1,139 +1,227 @@
-# GCP Private Service Connect with Port Mapping NEG
+# ScyllaDB + GCP Private Service Connect
 
-Terraform modules for exposing a ScyllaDB cluster through GCP Private Service Connect using a Port Mapping NEG (`GCE_VM_IP_PORTMAP`), enabling per-node routing through a single PSC endpoint.
+POC for ScyllaDB Cloud PSC support. Uses native GCP port mapping NEGs so clients reach individual ScyllaDB nodes through a single PSC VIP:
 
-## Architecture
-
-![PSC Infrastructure Diagram](docs/architecture.png)
-
-### Traffic Flow
-
-A client in the consumer VPC connects to the PSC endpoint IP on a node-specific port. The traffic traverses Google's backbone through the PSC tunnel and arrives at the producer-side Internal TCP/UDP Load Balancer. The Port Mapping NEG translates the destination port to the correct backend instance and port:
-
-| Client Connects To | Client Port | Routed To             | Backend Port |
-|---------------------|-------------|-----------------------|--------------|
-| 10.138.0.56         | 9001        | node-3 (us-west1-a)  | 9042         |
-| 10.138.0.56         | 9002        | node-4 (us-west1-b)  | 9042         |
-| 10.138.0.56         | 9003        | node-5 (us-west1-c)  | 9042         |
-
-## Modules
-
-### psc-producer
-
-Producer-side infrastructure deployed in the ScyllaDB VPC.
-
-| Resource | Description |
-|----------|-------------|
-| **PSC NAT Subnet** | Dedicated subnet (e.g. `10.0.201.0/24`) for PSC network address translation. Consumer traffic arrives with source IPs from this range. |
-| **Port Mapping NEG** | Regional `GCE_VM_IP_PORTMAP` NEG that maps client-facing ports to specific backend instances. Each endpoint maps one client port to one instance:port pair. **Key constraint: each instance can only appear once.** |
-| **Backend Service** | Regional backend service with the port mapping NEG attached. Health checks are not supported with port mapping NEG backends. |
-| **Forwarding Rule** | Internal passthrough LB forwarding rule with `all_ports=true`. Required as the target for the PSC service attachment. |
-| **Service Attachment** | Exposes the forwarding rule to consumer VPCs. Uses the NAT subnet for address translation. |
-| **Firewall Rule** | Permits traffic from the PSC NAT subnet to reach ScyllaDB nodes on the backend port. Without this, PSC traffic is silently dropped. |
-
-### psc-consumer
-
-Consumer-side infrastructure deployed in the client VPC.
-
-| Resource | Description |
-|----------|-------------|
-| **PSC Consumer Endpoint** | Forwarding rule targeting the producer's service attachment, with a static internal IP (`GCE_ENDPOINT` purpose). |
-| **Private DNS Zone** | Private DNS zone (e.g. `cluster-1.scylladb.com`) visible within the consumer VPC. |
-| **DNS A Records** | Root domain and per-node records, all pointing to the PSC endpoint IP. |
-
-## Usage
-
-### Producer
-
-```hcl
-project_id = "my-project"
-region     = "us-west1"
-
-network = "scylladb-vpc"
-subnet  = "scylladb-subnet"
-
-nat_subnet_cidr = "10.0.201.0/24"
-name_prefix     = "scylla-psc"
-
-nodes = [
-  {
-    instance_self_link = "projects/my-project/zones/us-west1-a/instances/scylla-node-0"
-    client_port        = 9001
-    backend_port       = 9042
-  },
-  {
-    instance_self_link = "projects/my-project/zones/us-west1-b/instances/scylla-node-1"
-    client_port        = 9002
-    backend_port       = 9042
-  },
-  {
-    instance_self_link = "projects/my-project/zones/us-west1-c/instances/scylla-node-2"
-    client_port        = 9003
-    backend_port       = 9042
-  },
-]
-
-connection_preference = "ACCEPT_AUTOMATIC"
+```
+PSC_VIP:10001  ->  node1:9042
+PSC_VIP:10002  ->  node2:9042
+PSC_VIP:10003  ->  node3:9042
 ```
 
-### Consumer
+The producer-side infrastructure (Port Mapping NEG, ILB, PSC Service Attachment) is deployed directly in the ScyllaDB VPC — simulating what ScyllaDB Cloud would provide natively. No proxies, no VPC peering.
 
-```hcl
-project_id = "consumer-project"
-region     = "us-west1"
+See [ARCH.md](ARCH.md) for the full architecture.
 
-network = "default"
-subnet  = "default"
+## Prerequisites
 
-service_attachment_id = "projects/my-project/regions/us-west1/serviceAttachments/scylla-psc-sa"
+| Tool | Version | Purpose |
+|---|---|---|
+| [Terraform](https://developer.hashicorp.com/terraform/install) | >= 1.5.0 | Infrastructure provisioning |
+| [gcloud CLI](https://cloud.google.com/sdk/docs/install) | latest | GCP authentication, instance discovery, SSH |
+| [jq](https://jqlang.github.io/jq/download/) | any | JSON parsing in deploy scripts |
 
-name_prefix = "scylla-psc"
-dns_domain  = "cluster-1.scylladb.com"
+## Credentials
 
-nodes = [
-  { name = "node-0", port = 9001 },
-  { name = "node-1", port = 9002 },
-  { name = "node-2", port = 9003 },
-]
+### GCP Credentials
+
+Required IAM roles on the target project:
+
+- `roles/compute.admin` — VPCs, subnets, VMs, firewall rules, forwarding rules, NEGs, service attachments
+- `roles/iam.serviceAccountUser` — attach service accounts to VMs
+
+Authenticate:
+
+```bash
+gcloud auth application-default login
+gcloud config set project YOUR_PROJECT_ID
 ```
 
-## Port Mapping NEG: The Round-Robin Limitation
+Or use a service account:
 
-### The Problem
+```bash
+export GOOGLE_APPLICATION_CREDENTIALS="/path/to/service-account-key.json"
+```
 
-In a `GCE_VM_IP_PORTMAP` NEG, **each VM instance can only appear once**. This means you cannot add a shared round-robin port (e.g. `9042`) alongside the per-node port mappings.
+Required GCP APIs:
 
-The current mappings work because each instance has exactly one entry:
+```bash
+gcloud services enable compute.googleapis.com
+gcloud services enable servicenetworking.googleapis.com
+```
 
-| Client Port | Backend Instance | Backend Port |
-|-------------|------------------|--------------|
-| 9001        | node-3           | 9042         |
-| 9002        | node-4           | 9042         |
-| 9003        | node-5           | 9042         |
+### ScyllaDB Cloud API Token
 
-Adding round-robin on port 9042 would require three more entries — all of which fail:
+1. Log in to [ScyllaDB Cloud Console](https://cloud.scylladb.com/)
+2. Go to **Settings** > **API Keys**
+3. Click **Generate API Key**
+4. Copy the token
 
-| Client Port | Backend Instance | Backend Port | Result |
-|-------------|------------------|--------------|--------|
-| 9042        | node-3           | 9042         | **FAILS**: node-3 already has a mapping |
-| 9042        | node-4           | 9042         | **FAILS**: node-4 already has a mapping |
-| 9042        | node-5           | 9042         | **FAILS**: node-5 already has a mapping |
+```bash
+export SCYLLA_API_TOKEN="your-token"
+```
 
-GCP returns `INVALID_ARGUMENT` because the constraint is **per-instance**, not per-port.
+### Environment Variables
 
-### Why
+| Variable | Required | Default | Used by | Description |
+|---|---|---|---|---|
+| `SCYLLA_API_TOKEN` | Yes | — | 01-cluster | ScyllaDB Cloud API token |
+| `SCYLLADB_CLOUD_ENDPOINT` | No | `https://api.cloud.scylladb.com` | 01-cluster | ScyllaDB Cloud API server URL |
+| `GCP_PROJECT_ID` | Yes | — | 02, 03, 04 | GCP project ID |
+| `REGION` | No | `us-east1` | all stages | GCP region |
+| `ZONE` | No | `us-east1-b` | 03-loader | GCP zone for loader VM |
+| `PORT_BASE` | No | `10001` | 02, 03, 04 | First port in the per-node mapping range |
 
-Port mapping NEGs are a 1:1 lookup table: `(client_port) → (instance, backend_port)`. The NEG acts as a port-based router, not a load balancer. There is no mechanism for multiple instances to share the same client-facing port.
+The ScyllaDB VPC name and subnet are auto-discovered from node VM instances.
 
-### Workarounds
+See `terraform/terraform.tfvars.example` for all Terraform-level defaults.
 
-| Approach | Trade-off |
-|----------|-----------|
-| **CQL driver with all 3 ports** | Driver connects to 9001, 9002, 9003 directly — most ScyllaDB drivers handle multi-node topology natively. **Recommended.** |
-| **Proxy VM** | HAProxy on a dedicated VM listening on 9042, round-robining to the 3 nodes. Adds a hop and a SPOF. |
-| **Multiple PSC endpoints** | One PSC endpoint per node, each on port 9042. Consumer must create 3 forwarding rules + 3 IPs. |
-| **Second NEG + second PSC** | Separate NEG with `9042→node-X:9042` for one node via a second service attachment. Not true round-robin. |
+## Deploy
 
-### Recommendation
+### All stages at once
 
-Use the per-node ports (9001, 9002, 9003) as contact points in the CQL driver. The driver discovers the full topology after initial connection and routes queries to the correct node automatically — round-robin on the connection port is unnecessary.
+```bash
+export SCYLLA_API_TOKEN="your-token"
+export GCP_PROJECT_ID="your-project"
+
+./scripts/deploy.sh
+```
+
+### Individual stages
+
+Each stage can be run independently. Stages read outputs from previous stages via `terraform output`, so prerequisites must be deployed first.
+
+```bash
+# Stage 01: ScyllaDB Cloud cluster
+export SCYLLA_API_TOKEN="your-token"
+./scripts/01-cluster.sh
+
+# Stage 02: Port Mapping NEG + ILB + PSC attachment (in ScyllaDB VPC)
+export GCP_PROJECT_ID="your-project"
+./scripts/02-producer-psc.sh
+
+# Stage 03: Consumer VPC + Cloud NAT + loader VM
+export GCP_PROJECT_ID="your-project"
+./scripts/03-loader.sh
+
+# Stage 04: PSC endpoint connecting consumer to producer
+export GCP_PROJECT_ID="your-project"
+./scripts/04-psc-connect.sh
+```
+
+| Script | What it deploys | Reads from |
+|---|---|---|
+| `01-cluster.sh` | ScyllaDB Cloud cluster + CQL credentials | — |
+| `02-producer-psc.sh` | Port Mapping NEG, ILB, PSC Service Attachment in ScyllaDB VPC | stage 01 |
+| `03-loader.sh` | Consumer VPC, subnet, Cloud NAT, loader VM | stage 01 |
+| `04-psc-connect.sh` | PSC endpoint forwarding rule | stages 01, 02, 03 |
+
+Stages 02 and 03 both depend only on stage 01, so they can be run in either order. Stage 04 depends on all three.
+
+### Output
+
+```
+=========================================
+  Deployment complete!
+=========================================
+PSC Endpoint IP:  10.1.1.10
+Loader VM:        latte-loader (us-east1-b)
+
+Port mapping (PSC_VIP:port -> node:9042):
+  10.1.1.10:10001 -> 10.x.x.1:9042
+  10.1.1.10:10002 -> 10.x.x.2:9042
+  10.1.1.10:10003 -> 10.x.x.3:9042
+```
+
+## Run Benchmarks
+
+```bash
+./scripts/run-latte.sh
+```
+
+SSHs into the loader VM via IAP tunnel and runs [Latte](https://github.com/scylladb/latte) against the first node via PSC.
+
+| Variable | Default | Description |
+|---|---|---|
+| `LATTE_DURATION` | `60s` | Duration of each workload phase |
+| `LATTE_RATE` | `1000` | Target operations per second |
+| `LATTE_CONNECTIONS` | `4` | Number of CQL connections |
+
+```bash
+LATTE_DURATION=120s LATTE_RATE=5000 ./scripts/run-latte.sh
+```
+
+## Port Mapping and Driver Address Translation
+
+Each node gets a unique port: `client_port = PORT_BASE + node_index`.
+
+ScyllaDB drivers discover nodes via internal IPs that aren't reachable through PSC. Your driver must translate:
+
+```
+discovered node_private_ip:9042  ->  PSC_VIP:mapped_port
+```
+
+Get the mapping:
+
+```bash
+cd terraform/04-psc-connect
+terraform output -json port_mapping
+```
+
+## Destroy
+
+```bash
+./scripts/destroy.sh
+```
+
+## Project Structure
+
+```
+.
+├── ARCH.md                              # Architecture document
+├── README.md
+├── scripts/
+│   ├── deploy.sh                        # Full deployment (all 4 stages)
+│   ├── 01-cluster.sh                    # Stage 01 only
+│   ├── 02-producer-psc.sh              # Stage 02 only
+│   ├── 03-loader.sh                     # Stage 03 only
+│   ├── 04-psc-connect.sh               # Stage 04 only
+│   ├── destroy.sh                       # Full teardown
+│   └── run-latte.sh                     # Run benchmarks
+├── terraform/
+│   ├── terraform.tfvars.example
+│   ├── 01-cluster/                      # ScyllaDB Cloud cluster
+│   ├── 02-producer-psc/                 # Port Mapping NEG + ILB + PSC (in ScyllaDB VPC)
+│   ├── 03-loader/                       # Consumer VPC + loader VM
+│   └── 04-psc-connect/                  # PSC endpoint connection
+└── workloads/
+    └── basic_read_write.rn              # Latte benchmark workload
+```
+
+## Troubleshooting
+
+### Cannot SSH to loader VM
+
+Ensure IAP is enabled and you have the right role:
+
+```bash
+gcloud services enable iap.googleapis.com
+```
+
+Your account needs `roles/iap.tunnelResourceAccessor`.
+
+### Loader VM not ready
+
+Startup script takes 2-3 minutes. Check:
+
+```bash
+gcloud compute ssh latte-loader --zone=us-east1-b --project=$GCP_PROJECT_ID --tunnel-through-iap \
+  -- cat /opt/latte/setup.done
+```
+
+### PSC NAT subnet CIDR conflict
+
+The PSC NAT subnet (`10.0.201.0/24`) is created in the ScyllaDB VPC. If it overlaps with an existing subnet, override in stage 02:
+
+```bash
+-var="psc_nat_subnet_cidr=10.0.211.0/24"
+```
