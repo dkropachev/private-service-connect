@@ -1,0 +1,44 @@
+pub async fn schema(ctx) {
+    let session = ctx.session;
+    session.execute("
+        CREATE KEYSPACE IF NOT EXISTS latte
+        WITH replication = {
+            'class': 'NetworkTopologyStrategy',
+            'replication_factor': 3
+        }
+    ").await?;
+    session.execute("
+        CREATE TABLE IF NOT EXISTS latte.basic (
+            key bigint PRIMARY KEY,
+            value text
+        )
+    ").await?;
+    Ok(())
+}
+
+pub async fn erase(ctx) {
+    let session = ctx.session;
+    session.execute("TRUNCATE latte.basic").await?;
+    Ok(())
+}
+
+pub async fn write(ctx) {
+    let session = ctx.session;
+    let key = ctx.gen_key();
+    let value = ctx.gen_str(256);
+    session.execute(
+        "INSERT INTO latte.basic (key, value) VALUES (?, ?)",
+        (key, value),
+    ).await?;
+    Ok(())
+}
+
+pub async fn read(ctx) {
+    let session = ctx.session;
+    let key = ctx.gen_key();
+    session.execute(
+        "SELECT key, value FROM latte.basic WHERE key = ?",
+        (key,),
+    ).await?;
+    Ok(())
+}

@@ -1,0 +1,30 @@
+# --- Required ---
+# GCP project ID
+gcp_project_id = "my-gcp-project"
+
+# --- Optional overrides ---
+# region               = "us-east1"
+# zone                 = "us-east1-b"
+
+# Stage 01: cluster
+# cluster_name         = "psc-benchmark-cluster"
+# node_count           = 3
+# node_type            = "n2-highmem-4"
+# scylla_version       = "2024.2"
+
+# Stage 02: producer-psc
+# psc_nat_subnet_cidr  = "10.0.201.0/24"
+# port_base            = 10001
+
+# Stage 03: loader
+# consumer_subnet_cidr = "10.1.1.0/24"
+# psc_endpoint_ip      = "10.1.1.10"
+# loader_machine_type  = "e2-standard-4"
+
+# Stage 04: psc-connect
+# psc_endpoint_ip      = "10.1.1.10"
+
+# --- Environment variables (not in this file) ---
+# export SCYLLA_API_TOKEN="your-scylladb-cloud-api-token"
+# export GCP_PROJECT_ID="my-gcp-project"
+# ScyllaDB VPC name and subnet are auto-discovered from node instances
