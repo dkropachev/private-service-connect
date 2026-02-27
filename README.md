@@ -3,14 +3,18 @@
 POC for ScyllaDB Cloud PSC support. Uses native GCP port mapping NEGs so clients reach individual ScyllaDB nodes through a single PSC VIP:
 
 ```
-PSC_VIP:10001  ->  node1:9042
-PSC_VIP:10002  ->  node2:9042
-PSC_VIP:10003  ->  node3:9042
+PSC_VIP:9001  ->  node1:9042
+PSC_VIP:9002  ->  node2:9042
+PSC_VIP:9003  ->  node3:9042
 ```
 
 The producer-side infrastructure (Port Mapping NEG, ILB, PSC Service Attachment) is deployed directly in the ScyllaDB VPC — simulating what ScyllaDB Cloud would provide natively. No proxies, no VPC peering.
 
-See [ARCH.md](ARCH.md) for the full architecture.
+## Architecture
+
+![Architecture Diagram](docs/architecture.png)
+
+See [ARCH.md](ARCH.md) for full details.
 
 ## Prerequisites
 
@@ -18,28 +22,22 @@ See [ARCH.md](ARCH.md) for the full architecture.
 |---|---|---|
 | [Terraform](https://developer.hashicorp.com/terraform/install) | >= 1.5.0 | Infrastructure provisioning |
 | [gcloud CLI](https://cloud.google.com/sdk/docs/install) | latest | GCP authentication, instance discovery, SSH |
-| [jq](https://jqlang.github.io/jq/download/) | any | JSON parsing in deploy scripts |
+| [jq](https://jqlang.github.io/jq/download/) | any | JSON parsing |
+| [GNU Make](https://www.gnu.org/software/make/) | any | Orchestration |
 
 ## Credentials
 
-### GCP Credentials
+### GCP
 
 Required IAM roles on the target project:
 
 - `roles/compute.admin` — VPCs, subnets, VMs, firewall rules, forwarding rules, NEGs, service attachments
 - `roles/iam.serviceAccountUser` — attach service accounts to VMs
-
-Authenticate:
+- `roles/iap.tunnelResourceAccessor` — SSH into VMs via IAP tunnel
 
 ```bash
 gcloud auth application-default login
 gcloud config set project YOUR_PROJECT_ID
-```
-
-Or use a service account:
-
-```bash
-export GOOGLE_APPLICATION_CREDENTIALS="/path/to/service-account-key.json"
 ```
 
 Required GCP APIs:
@@ -47,6 +45,7 @@ Required GCP APIs:
 ```bash
 gcloud services enable compute.googleapis.com
 gcloud services enable servicenetworking.googleapis.com
+gcloud services enable iap.googleapis.com
 ```
 
 ### ScyllaDB Cloud API Token
@@ -60,117 +59,100 @@ gcloud services enable servicenetworking.googleapis.com
 export SCYLLA_API_TOKEN="your-token"
 ```
 
-### Environment Variables
+## Variables
 
-| Variable | Required | Default | Used by | Description |
-|---|---|---|---|---|
-| `SCYLLA_API_TOKEN` | Yes | — | 01-cluster | ScyllaDB Cloud API token |
-| `SCYLLADB_CLOUD_ENDPOINT` | No | `https://api.cloud.scylladb.com` | 01-cluster | ScyllaDB Cloud API server URL |
-| `GCP_PROJECT_ID` | Yes | — | 02, 03, 04 | GCP project ID |
-| `REGION` | No | `us-east1` | all stages | GCP region |
-| `ZONE` | No | `us-east1-b` | 03-loader | GCP zone for loader VM |
-| `PORT_BASE` | No | `10001` | 02, 03, 04 | First port in the per-node mapping range |
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `GCP_PROJECT_ID` | Yes | — | GCP project (stages 02-04, 06, 08) |
+| `SCYLLA_API_TOKEN` | Yes | — | ScyllaDB Cloud API token (stage 01) |
+| `SCYLLA_VPC_NAME` | Yes | — | ScyllaDB VPC name (stages 02-04, 06) |
+| `CQL_USERNAME` | Yes | — | CQL username (stage 03) |
+| `CQL_PASSWORD` | Yes | — | CQL password (stage 03) |
+| `REGION` | No | auto-discovered | GCP region (derived from VPC instances) |
+| `ZONE` | No | `REGION-b` | GCP zone |
+| `CQL_PORT_BASE` | No | `9001` | Base CQL port in the per-node mapping range |
+| `SSL_CQL_PORT_BASE` | No | `CQL_PORT_BASE+100` | Base SSL CQL port |
+| `DNS_DOMAIN` | No | `dk-test.duckdns.org` | GCP-verified DNS domain for PSC |
+| `PSC_ENDPOINT_NAME` | No | `scylladb-psc-endpoint` | PSC endpoint name |
+| `LATTE_DURATION` | No | `60s` | Benchmark duration |
+| `LATTE_RATE` | No | `1000` | Benchmark target ops/s |
+| `LATTE_CONNECTIONS` | No | `4` | Benchmark CQL connections |
 
-The ScyllaDB VPC name and subnet are auto-discovered from node VM instances.
+Region and zone are auto-discovered from VPC instance metadata. Override with `REGION=` / `ZONE=` if needed.
 
-See `terraform/terraform.tfvars.example` for all Terraform-level defaults.
+## Stages
+
+| Stage | Target | What it does |
+|---|---|---|
+| 01 | `stage-01-cluster` | Create ScyllaDB Cloud cluster |
+| 02 | `stage-02-producer-psc` | Port Mapping NEG + ILB + PSC Service Attachment (in ScyllaDB VPC) |
+| 03 | `stage-03-loader` | Consumer VPC + Cloud NAT + loader VM |
+| 04 | `stage-04-psc-connect` | PSC endpoint connecting consumer to producer |
+| 05 | `stage-05-check-dns` | Verify DNS resolution for PSC FQDN |
+| 06 | `stage-06-check-cql` | Verify CQL port reachability (via loader VM) |
+| 07 | `stage-07-configure-scylla` | Configure ScyllaDB client routes via REST API |
+| 08 | `stage-08-bench` | Run latte benchmark (via loader VM) |
+
+Stages 01-04 provision infrastructure (Terraform). Stages 05-07 are stateless checks/config. Stage 08 deploys and runs the benchmark.
 
 ## Deploy
 
-### All stages at once
+### Full pipeline
 
 ```bash
 export SCYLLA_API_TOKEN="your-token"
-export GCP_PROJECT_ID="your-project"
+make deploy GCP_PROJECT_ID=your-project SCYLLA_VPC_NAME=your-vpc CQL_USERNAME=user CQL_PASSWORD=pass
+```
 
-./scripts/deploy.sh
+### With existing cluster (stages 02-08)
+
+```bash
+make stages-02-08 GCP_PROJECT_ID=your-project SCYLLA_VPC_NAME=your-vpc CQL_USERNAME=user CQL_PASSWORD=pass
+```
+
+### Infrastructure only (stages 02-06)
+
+```bash
+make stages-02-06 GCP_PROJECT_ID=your-project SCYLLA_VPC_NAME=your-vpc CQL_USERNAME=user CQL_PASSWORD=pass
 ```
 
 ### Individual stages
 
-Each stage can be run independently. Stages read outputs from previous stages via `terraform output`, so prerequisites must be deployed first.
-
 ```bash
-# Stage 01: ScyllaDB Cloud cluster
-export SCYLLA_API_TOKEN="your-token"
-./scripts/01-cluster.sh
-
-# Stage 02: Port Mapping NEG + ILB + PSC attachment (in ScyllaDB VPC)
-export GCP_PROJECT_ID="your-project"
-./scripts/02-producer-psc.sh
-
-# Stage 03: Consumer VPC + Cloud NAT + loader VM
-export GCP_PROJECT_ID="your-project"
-./scripts/03-loader.sh
-
-# Stage 04: PSC endpoint connecting consumer to producer
-export GCP_PROJECT_ID="your-project"
-./scripts/04-psc-connect.sh
+make stage-02-producer-psc GCP_PROJECT_ID=your-project SCYLLA_VPC_NAME=your-vpc
+make stage-05-check-dns
+make stage-08-bench GCP_PROJECT_ID=your-project
 ```
 
-| Script | What it deploys | Reads from |
-|---|---|---|
-| `01-cluster.sh` | ScyllaDB Cloud cluster + CQL credentials | — |
-| `02-producer-psc.sh` | Port Mapping NEG, ILB, PSC Service Attachment in ScyllaDB VPC | stage 01 |
-| `03-loader.sh` | Consumer VPC, subnet, Cloud NAT, loader VM | stage 01 |
-| `04-psc-connect.sh` | PSC endpoint forwarding rule | stages 01, 02, 03 |
-
-Stages 02 and 03 both depend only on stage 01, so they can be run in either order. Stage 04 depends on all three.
-
-### Output
-
-```
-=========================================
-  Deployment complete!
-=========================================
-PSC Endpoint IP:  10.1.1.10
-Loader VM:        latte-loader (us-east1-b)
-
-Port mapping (PSC_VIP:port -> node:9042):
-  10.1.1.10:10001 -> 10.x.x.1:9042
-  10.1.1.10:10002 -> 10.x.x.2:9042
-  10.1.1.10:10003 -> 10.x.x.3:9042
-```
-
-## Run Benchmarks
-
-```bash
-./scripts/run-latte.sh
-```
-
-SSHs into the loader VM via IAP tunnel and runs [Latte](https://github.com/scylladb/latte) against the first node via PSC.
-
-| Variable | Default | Description |
-|---|---|---|
-| `LATTE_DURATION` | `60s` | Duration of each workload phase |
-| `LATTE_RATE` | `1000` | Target operations per second |
-| `LATTE_CONNECTIONS` | `4` | Number of CQL connections |
-
-```bash
-LATTE_DURATION=120s LATTE_RATE=5000 ./scripts/run-latte.sh
-```
-
-## Port Mapping and Driver Address Translation
-
-Each node gets a unique port: `client_port = PORT_BASE + node_index`.
-
-ScyllaDB drivers discover nodes via internal IPs that aren't reachable through PSC. Your driver must translate:
-
-```
-discovered node_private_ip:9042  ->  PSC_VIP:mapped_port
-```
-
-Get the mapping:
-
-```bash
-cd terraform/04-psc-connect
-terraform output -json port_mapping
-```
+Run `make help` for the full list.
 
 ## Destroy
 
 ```bash
-./scripts/destroy.sh
+# All stages (reverse order)
+make destroy GCP_PROJECT_ID=your-project
+
+# Individual stage
+make destroy-03-loader GCP_PROJECT_ID=your-project
+```
+
+## Port Mapping and Driver Address Translation
+
+Each node gets a unique port: `client_port = CQL_PORT_BASE + node_index`.
+
+ScyllaDB drivers discover nodes via internal IPs that aren't reachable through PSC. Your driver must translate:
+
+```
+discovered node_private_ip:9042  ->  PSC_FQDN:mapped_port
+```
+
+Stage 07 (`configure-scylla`) automates this by pushing client routes to the ScyllaDB REST API.
+
+Get the mapping manually:
+
+```bash
+cd terraform/04-psc-connect
+terraform output -json port_mapping
 ```
 
 ## Project Structure
@@ -179,20 +161,16 @@ terraform output -json port_mapping
 .
 ├── ARCH.md                              # Architecture document
 ├── README.md
-├── scripts/
-│   ├── deploy.sh                        # Full deployment (all 4 stages)
-│   ├── 01-cluster.sh                    # Stage 01 only
-│   ├── 02-producer-psc.sh              # Stage 02 only
-│   ├── 03-loader.sh                     # Stage 03 only
-│   ├── 04-psc-connect.sh               # Stage 04 only
-│   ├── destroy.sh                       # Full teardown
-│   └── run-latte.sh                     # Run benchmarks
+├── Makefile                             # Orchestration (all stages)
+├── docs/
+│   └── architecture.png                 # Architecture diagram
 ├── terraform/
 │   ├── terraform.tfvars.example
 │   ├── 01-cluster/                      # ScyllaDB Cloud cluster
 │   ├── 02-producer-psc/                 # Port Mapping NEG + ILB + PSC (in ScyllaDB VPC)
 │   ├── 03-loader/                       # Consumer VPC + loader VM
-│   └── 04-psc-connect/                  # PSC endpoint connection
+│   ├── 04-psc-connect/                  # PSC endpoint connection
+│   └── 08-bench/                        # Benchmark VM
 └── workloads/
     └── basic_read_write.rn              # Latte benchmark workload
 ```
@@ -214,7 +192,7 @@ Your account needs `roles/iap.tunnelResourceAccessor`.
 Startup script takes 2-3 minutes. Check:
 
 ```bash
-gcloud compute ssh latte-loader --zone=us-east1-b --project=$GCP_PROJECT_ID --tunnel-through-iap \
+gcloud compute ssh latte-loader --zone=us-west1-b --project=$GCP_PROJECT_ID --tunnel-through-iap \
   -- cat /opt/latte/setup.done
 ```
 
@@ -224,4 +202,13 @@ The PSC NAT subnet (`10.0.201.0/24`) is created in the ScyllaDB VPC. If it overl
 
 ```bash
 -var="psc_nat_subnet_cidr=10.0.211.0/24"
+```
+
+### Missing required variables
+
+Each stage validates its inputs and prints what's missing:
+
+```bash
+$ make stage-02-producer-psc
+Makefile:47: *** GCP_PROJECT_ID is required. Set it via env or make var: make stage-02-producer-psc GCP_PROJECT_ID=...  Stop.
 ```
