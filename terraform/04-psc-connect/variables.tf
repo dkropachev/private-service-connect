@@ -24,6 +24,12 @@ variable "consumer_subnet_id" {
   type        = string
 }
 
+variable "psc_endpoint_name" {
+  description = "Name of the PSC endpoint forwarding rule (becomes the DNS subdomain)"
+  type        = string
+  default     = "scylladb-psc-endpoint"
+}
+
 variable "psc_endpoint_ip" {
   description = "Static IP for the PSC endpoint"
   type        = string

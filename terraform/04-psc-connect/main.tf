@@ -10,7 +10,7 @@ resource "google_compute_address" "psc_endpoint" {
 }
 
 resource "google_compute_forwarding_rule" "psc_endpoint" {
-  name                  = "psc-endpoint"
+  name                  = var.psc_endpoint_name
   region                = var.region
   load_balancing_scheme = ""
   target                = var.service_attachment_self_link

@@ -140,6 +140,7 @@ stage-04-psc-connect:
 		-var="service_attachment_self_link=$${_SERVICE_ATTACHMENT}" \
 		-var="consumer_vpc_id=$${_CONSUMER_VPC_ID}" \
 		-var="consumer_subnet_id=$${_CONSUMER_SUBNET_ID}" \
+		-var="psc_endpoint_name=$(PSC_ENDPOINT_NAME)" \
 		-var="port_base=$(PORT_BASE)" \
 		-var="node_private_ips=$${_NODE_IPS_JSON}"
 	echo ""

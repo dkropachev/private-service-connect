@@ -96,6 +96,7 @@ resource "google_compute_instance" "loader" {
 
   network_interface {
     subnetwork = google_compute_subnetwork.consumer.self_link
+    access_config {}
   }
 
   metadata_startup_script = local.loader_startup_script
