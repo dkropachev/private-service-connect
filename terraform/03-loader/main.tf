@@ -83,6 +83,10 @@ resource "google_compute_instance" "loader" {
 
   tags = ["loader"]
 
+  labels = {
+    owner = "psc-poc"
+  }
+
   boot_disk {
     initialize_params {
       image = "debian-cloud/debian-12"

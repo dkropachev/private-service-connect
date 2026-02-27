@@ -47,26 +47,29 @@ stage-02-producer-psc:
 	$(call check_var,GCP_PROJECT_ID)
 	$(call check_var,SCYLLA_VPC_NAME)
 	echo "=== Stage 02: Producer PSC (in ScyllaDB VPC) ==="
-	# Discover instances and subnet from VPC
+	# Discover node instances from VPC (filter out manager/monitor VMs)
 	echo "Discovering ScyllaDB nodes in VPC: $(SCYLLA_VPC_NAME)..."
 	_INSTANCES=$$(gcloud compute instances list \
 		--project="$(GCP_PROJECT_ID)" \
-		--filter="networkInterfaces[0].network ~ /$(SCYLLA_VPC_NAME)$$" \
+		--filter="networkInterfaces[0].network ~ /$(SCYLLA_VPC_NAME)$$ AND name ~ -node-" \
 		--format='json(name,zone.scope(zones),networkInterfaces[0].networkIP,networkInterfaces[0].subnetwork)')
 	_NODE_INSTANCES=$$(echo "$$_INSTANCES" | jq -c '[.[] | {name: .name, zone: .zone, ip: .networkInterfaces[0].networkIP}]')
 	_NODE_COUNT=$$(echo "$$_NODE_INSTANCES" | jq 'length')
 	if [ "$$_NODE_COUNT" -eq 0 ]; then
-		echo "ERROR: No instances found in VPC $(SCYLLA_VPC_NAME)"
+		echo "ERROR: No ScyllaDB node instances found in VPC $(SCYLLA_VPC_NAME)"
 		exit 1
 	fi
 	echo "Found $$_NODE_COUNT nodes: $$_NODE_INSTANCES"
+	# Auto-discover region and subnet from instances
+	_REGION=$$(echo "$$_INSTANCES" | jq -r '.[0].zone' | sed 's/-[a-z]$$//')
 	_SCYLLA_SUBNET_NAME=$$(echo "$$_INSTANCES" | jq -r '.[0].networkInterfaces[0].subnetwork' | xargs basename)
+	echo "Region: $$_REGION"
 	echo "ScyllaDB Subnet: $$_SCYLLA_SUBNET_NAME"
 	cd $(TF_DIR)/02-producer-psc
 	terraform init -input=false
 	terraform apply -input=false -auto-approve \
 		-var="gcp_project_id=$(GCP_PROJECT_ID)" \
-		-var="region=$(REGION)" \
+		-var="region=$$_REGION" \
 		-var="scylla_vpc_name=$(SCYLLA_VPC_NAME)" \
 		-var="scylla_subnet_name=$${_SCYLLA_SUBNET_NAME}" \
 		-var="node_instances=$${_NODE_INSTANCES}" \
@@ -85,19 +88,22 @@ stage-03-loader:
 	$(call check_var,CQL_USERNAME)
 	$(call check_var,CQL_PASSWORD)
 	echo "=== Stage 03: Loader Infrastructure ==="
-	# Discover node IPs from VPC
-	_NODE_IPS_JSON=$$(gcloud compute instances list \
+	# Discover node IPs and region from VPC (filter to node VMs only)
+	_INSTANCES=$$(gcloud compute instances list \
 		--project="$(GCP_PROJECT_ID)" \
-		--filter="networkInterfaces[0].network ~ /$(SCYLLA_VPC_NAME)$$" \
-		--format='json(networkInterfaces[0].networkIP)' | \
-		jq -c '[.[].networkInterfaces[0].networkIP]')
+		--filter="networkInterfaces[0].network ~ /$(SCYLLA_VPC_NAME)$$ AND name ~ -node-" \
+		--format='json(zone.scope(zones),networkInterfaces[0].networkIP)')
+	_NODE_IPS_JSON=$$(echo "$$_INSTANCES" | jq -c '[.[].networkInterfaces[0].networkIP]')
+	_REGION=$$(echo "$$_INSTANCES" | jq -r '.[0].zone' | sed 's/-[a-z]$$//')
+	_ZONE="$${_REGION}-b"
 	echo "Node IPs: $$_NODE_IPS_JSON"
+	echo "Region: $$_REGION  Zone: $$_ZONE"
 	cd $(TF_DIR)/03-loader
 	terraform init -input=false
 	terraform apply -input=false -auto-approve \
 		-var="gcp_project_id=$(GCP_PROJECT_ID)" \
-		-var="region=$(REGION)" \
-		-var="zone=$(ZONE)" \
+		-var="region=$$_REGION" \
+		-var="zone=$$_ZONE" \
 		-var="cql_username=$(CQL_USERNAME)" \
 		-var="cql_password=$(CQL_PASSWORD)" \
 		-var="port_base=$(PORT_BASE)" \
@@ -112,12 +118,13 @@ stage-04-psc-connect:
 	$(call check_var,GCP_PROJECT_ID)
 	$(call check_var,SCYLLA_VPC_NAME)
 	echo "=== Stage 04: PSC Connection ==="
-	# Discover node IPs from VPC
-	_NODE_IPS_JSON=$$(gcloud compute instances list \
+	# Discover node IPs and region from VPC (filter to node VMs only)
+	_INSTANCES=$$(gcloud compute instances list \
 		--project="$(GCP_PROJECT_ID)" \
-		--filter="networkInterfaces[0].network ~ /$(SCYLLA_VPC_NAME)$$" \
-		--format='json(networkInterfaces[0].networkIP)' | \
-		jq -c '[.[].networkInterfaces[0].networkIP]')
+		--filter="networkInterfaces[0].network ~ /$(SCYLLA_VPC_NAME)$$ AND name ~ -node-" \
+		--format='json(zone.scope(zones),networkInterfaces[0].networkIP)')
+	_NODE_IPS_JSON=$$(echo "$$_INSTANCES" | jq -c '[.[].networkInterfaces[0].networkIP]')
+	_REGION=$$(echo "$$_INSTANCES" | jq -r '.[0].zone' | sed 's/-[a-z]$$//')
 	# Read from prior stages
 	_SERVICE_ATTACHMENT="$$(cd $(TF_DIR)/02-producer-psc && terraform output -raw service_attachment_self_link 2>/dev/null)" \
 		|| { echo "ERROR: Cannot read service_attachment_self_link from stage 02."; exit 1; }
@@ -129,7 +136,7 @@ stage-04-psc-connect:
 	terraform init -input=false
 	terraform apply -input=false -auto-approve \
 		-var="gcp_project_id=$(GCP_PROJECT_ID)" \
-		-var="region=$(REGION)" \
+		-var="region=$$_REGION" \
 		-var="service_attachment_self_link=$${_SERVICE_ATTACHMENT}" \
 		-var="consumer_vpc_id=$${_CONSUMER_VPC_ID}" \
 		-var="consumer_subnet_id=$${_CONSUMER_SUBNET_ID}" \
@@ -160,29 +167,27 @@ stage-05-check-dns:
 stage-06-check-cql:
 	$(call check_var,GCP_PROJECT_ID)
 	$(call check_var,SCYLLA_VPC_NAME)
-	echo "=== Stage 06: CQL Port Check ==="
+	echo "=== Stage 06: CQL Port Check (via loader VM) ==="
 	FQDN="$(PSC_ENDPOINT_NAME).$(DNS_DOMAIN)"
-	# Discover node count from VPC
+	# Discover node count from VPC (filter to node VMs only)
 	NODE_COUNT=$$(gcloud compute instances list \
 		--project="$(GCP_PROJECT_ID)" \
-		--filter="networkInterfaces[0].network ~ /$(SCYLLA_VPC_NAME)$$" \
+		--filter="networkInterfaces[0].network ~ /$(SCYLLA_VPC_NAME)$$ AND name ~ -node-" \
 		--format='value(name)' | wc -l)
 	echo "Found $$NODE_COUNT nodes, checking CQL ports $(CQL_PORT_BASE)..$$(($(CQL_PORT_BASE) + NODE_COUNT - 1)) on $$FQDN"
-	FAILED=0
-	for i in $$(seq 0 $$((NODE_COUNT - 1))); do
-		PORT=$$(($(CQL_PORT_BASE) + i))
-		if timeout 5 bash -c "exec 3<>/dev/tcp/$$FQDN/$$PORT" 2>/dev/null; then
-			echo "  OK:   $$FQDN:$$PORT"
-		else
-			echo "  FAIL: $$FQDN:$$PORT"
-			FAILED=1
-		fi
-	done
-	if [ "$$FAILED" -eq 1 ]; then
-		echo ""
-		echo "Some CQL ports are not reachable"
-		exit 1
-	fi
+	# Read loader VM info from stage 03
+	LOADER_VM_NAME=$$(cd $(TF_DIR)/03-loader && terraform output -raw loader_vm_name 2>/dev/null) \
+		|| { echo "ERROR: Cannot read loader_vm_name from stage 03."; exit 1; }
+	LOADER_VM_ZONE=$$(cd $(TF_DIR)/03-loader && terraform output -raw loader_vm_zone 2>/dev/null) \
+		|| { echo "ERROR: Cannot read loader_vm_zone from stage 03."; exit 1; }
+	echo "Running check from $$LOADER_VM_NAME ($$LOADER_VM_ZONE)..."
+	# Build remote check script
+	REMOTE_CMD="FAILED=0; for i in \$$(seq 0 $$((NODE_COUNT - 1))); do PORT=\$$(($(CQL_PORT_BASE) + \$$i)); if timeout 5 bash -c \"exec 3<>/dev/tcp/$$FQDN/\$$PORT\" 2>/dev/null; then echo \"  OK:   $$FQDN:\$$PORT\"; else echo \"  FAIL: $$FQDN:\$$PORT\"; FAILED=1; fi; done; exit \$$FAILED"
+	gcloud compute ssh "$$LOADER_VM_NAME" \
+		--zone="$$LOADER_VM_ZONE" \
+		--project="$(GCP_PROJECT_ID)" \
+		--tunnel-through-iap \
+		-- bash -c "$$REMOTE_CMD"
 	echo ""
 	echo "All CQL ports reachable"
 
@@ -438,8 +443,8 @@ help:
 	@echo "    CQL_PASSWORD             CQL password (stage 03)"
 	@echo ""
 	@echo "  Optional — defaults:"
-	@echo "    REGION                   GCP region                    [us-east1]"
-	@echo "    ZONE                     GCP zone                      [REGION-b]"
+	@echo "    REGION                   GCP region                    [auto-discovered from VPC]"
+	@echo "    ZONE                     GCP zone                      [auto-discovered REGION-b]"
 	@echo "    CQL_PORT_BASE            Base CQL port                 [9001]"
 	@echo "    SSL_CQL_PORT_BASE        Base SSL CQL port             [CQL_PORT_BASE+100]"
 	@echo "    DNS_DOMAIN               GCP-verified DNS domain       [dk-test.duckdns.org]"
