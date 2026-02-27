@@ -8,8 +8,11 @@ REGION            ?= us-east1
 ZONE              ?= $(REGION)-b
 CQL_PORT_BASE     ?= 9001
 SSL_CQL_PORT_BASE ?= $(shell echo $$(($(CQL_PORT_BASE) + 100)))
-DNS_DOMAIN        ?=
+DNS_DOMAIN        ?= dk-test.duckdns.org
 PORT_BASE         ?= $(CQL_PORT_BASE)
+PSC_ENDPOINT_NAME ?= scylladb-psc-endpoint
+SCYLLA_API_HOST   ?= localhost:10000
+CONNECTION_ID     ?= 1
 LATTE_DURATION    ?= 60s
 LATTE_RATE        ?= 1000
 LATTE_CONNECTIONS ?= 4
@@ -24,8 +27,8 @@ endef
 
 # ─── Stage 01: ScyllaDB Cloud Cluster ────────────────────────────────
 
-.PHONY: stage-01
-stage-01:
+.PHONY: stage-01-cluster
+stage-01-cluster:
 	$(call check_var,SCYLLA_API_TOKEN)
 	echo "=== Stage 01: ScyllaDB Cloud Cluster ==="
 	cd $(TF_DIR)/01-cluster
@@ -39,55 +42,32 @@ stage-01:
 
 # ─── Stage 02: Producer PSC ──────────────────────────────────────────
 
-.PHONY: stage-02
-stage-02:
+.PHONY: stage-02-producer-psc
+stage-02-producer-psc:
 	$(call check_var,GCP_PROJECT_ID)
+	$(call check_var,SCYLLA_VPC_NAME)
 	echo "=== Stage 02: Producer PSC (in ScyllaDB VPC) ==="
-	# Resolve node IPs — explicit NODE_IPS or read from stage 01
-	if [ -n "$${NODE_IPS:-}" ]; then
-		_NODE_IPS_JSON="$$(echo "$$NODE_IPS" | jq -c '
-			if type == "array" then . else split(",") end
-		')"
-	else
-		_NODE_IPS_JSON="$$(cd $(TF_DIR)/01-cluster && terraform output -json node_private_ips 2>/dev/null)" \
-			|| { echo "ERROR: Cannot read node_private_ips from stage 01. Set NODE_IPS explicitly."; exit 1; }
+	# Discover instances and subnet from VPC
+	echo "Discovering ScyllaDB nodes in VPC: $(SCYLLA_VPC_NAME)..."
+	_INSTANCES=$$(gcloud compute instances list \
+		--project="$(GCP_PROJECT_ID)" \
+		--filter="networkInterfaces[0].network ~ /$(SCYLLA_VPC_NAME)$$" \
+		--format='json(name,zone.scope(zones),networkInterfaces[0].networkIP,networkInterfaces[0].subnetwork)')
+	_NODE_INSTANCES=$$(echo "$$_INSTANCES" | jq -c '[.[] | {name: .name, zone: .zone, ip: .networkInterfaces[0].networkIP}]')
+	_NODE_COUNT=$$(echo "$$_NODE_INSTANCES" | jq 'length')
+	if [ "$$_NODE_COUNT" -eq 0 ]; then
+		echo "ERROR: No instances found in VPC $(SCYLLA_VPC_NAME)"
+		exit 1
 	fi
-	# Resolve VPC/subnet/instances — explicit overrides or auto-discover
-	if [ -n "$${SCYLLA_VPC_NAME:-}" ] && [ -n "$${SCYLLA_SUBNET_NAME:-}" ] && [ -n "$${NODE_INSTANCES:-}" ]; then
-		echo "Using explicit SCYLLA_VPC_NAME, SCYLLA_SUBNET_NAME, NODE_INSTANCES"
-		_SCYLLA_VPC_NAME="$$SCYLLA_VPC_NAME"
-		_SCYLLA_SUBNET_NAME="$$SCYLLA_SUBNET_NAME"
-		_NODE_INSTANCES="$$NODE_INSTANCES"
-	else
-		echo "Discovering ScyllaDB node instances from IPs..."
-		IP_FILTER=""
-		for ip in $$(echo "$$_NODE_IPS_JSON" | jq -r '.[]'); do
-			[ -n "$$IP_FILTER" ] && IP_FILTER+=" OR "
-			IP_FILTER+="networkInterfaces[0].networkIP=$${ip}"
-		done
-		_NODE_INSTANCES=$$(gcloud compute instances list \
-			--project="$(GCP_PROJECT_ID)" \
-			--filter="$$IP_FILTER" \
-			--format='json(name,zone.scope(zones),networkInterfaces[0].networkIP)' | \
-			jq -c '[.[] | {name: .name, zone: .zone, ip: .networkInterfaces[0].networkIP}]')
-		echo "Node instances: $$_NODE_INSTANCES"
-		FIRST_NAME=$$(echo "$$_NODE_INSTANCES" | jq -r '.[0].name')
-		FIRST_ZONE=$$(echo "$$_NODE_INSTANCES" | jq -r '.[0].zone')
-		INSTANCE_INFO=$$(gcloud compute instances describe "$$FIRST_NAME" \
-			--zone="$$FIRST_ZONE" \
-			--project="$(GCP_PROJECT_ID)" \
-			--format='json(networkInterfaces[0].network,networkInterfaces[0].subnetwork)')
-		_SCYLLA_VPC_NAME=$$(echo "$$INSTANCE_INFO" | jq -r '.networkInterfaces[0].network' | xargs basename)
-		_SCYLLA_SUBNET_NAME=$$(echo "$$INSTANCE_INFO" | jq -r '.networkInterfaces[0].subnetwork' | xargs basename)
-		echo "ScyllaDB VPC:    $$_SCYLLA_VPC_NAME"
-		echo "ScyllaDB Subnet: $$_SCYLLA_SUBNET_NAME"
-	fi
+	echo "Found $$_NODE_COUNT nodes: $$_NODE_INSTANCES"
+	_SCYLLA_SUBNET_NAME=$$(echo "$$_INSTANCES" | jq -r '.[0].networkInterfaces[0].subnetwork' | xargs basename)
+	echo "ScyllaDB Subnet: $$_SCYLLA_SUBNET_NAME"
 	cd $(TF_DIR)/02-producer-psc
 	terraform init -input=false
 	terraform apply -input=false -auto-approve \
 		-var="gcp_project_id=$(GCP_PROJECT_ID)" \
 		-var="region=$(REGION)" \
-		-var="scylla_vpc_name=$${_SCYLLA_VPC_NAME}" \
+		-var="scylla_vpc_name=$(SCYLLA_VPC_NAME)" \
 		-var="scylla_subnet_name=$${_SCYLLA_SUBNET_NAME}" \
 		-var="node_instances=$${_NODE_INSTANCES}" \
 		-var="cql_port_base=$(CQL_PORT_BASE)" \
@@ -98,25 +78,28 @@ stage-02:
 
 # ─── Stage 03: Consumer VPC + Loader VM ──────────────────────────────
 
-.PHONY: stage-03
-stage-03:
+.PHONY: stage-03-loader
+stage-03-loader:
 	$(call check_var,GCP_PROJECT_ID)
+	$(call check_var,SCYLLA_VPC_NAME)
+	$(call check_var,CQL_USERNAME)
+	$(call check_var,CQL_PASSWORD)
 	echo "=== Stage 03: Loader Infrastructure ==="
-	# Read CQL credentials and node IPs from stage 01
-	_NODE_IPS_JSON="$$(cd $(TF_DIR)/01-cluster && terraform output -json node_private_ips 2>/dev/null)" \
-		|| { echo "ERROR: Cannot read node_private_ips from stage 01."; exit 1; }
-	_CQL_USERNAME="$$(cd $(TF_DIR)/01-cluster && terraform output -raw cql_username 2>/dev/null)" \
-		|| { echo "ERROR: Cannot read cql_username from stage 01."; exit 1; }
-	_CQL_PASSWORD="$$(cd $(TF_DIR)/01-cluster && terraform output -raw cql_password 2>/dev/null)" \
-		|| { echo "ERROR: Cannot read cql_password from stage 01."; exit 1; }
+	# Discover node IPs from VPC
+	_NODE_IPS_JSON=$$(gcloud compute instances list \
+		--project="$(GCP_PROJECT_ID)" \
+		--filter="networkInterfaces[0].network ~ /$(SCYLLA_VPC_NAME)$$" \
+		--format='json(networkInterfaces[0].networkIP)' | \
+		jq -c '[.[].networkInterfaces[0].networkIP]')
+	echo "Node IPs: $$_NODE_IPS_JSON"
 	cd $(TF_DIR)/03-loader
 	terraform init -input=false
 	terraform apply -input=false -auto-approve \
 		-var="gcp_project_id=$(GCP_PROJECT_ID)" \
 		-var="region=$(REGION)" \
 		-var="zone=$(ZONE)" \
-		-var="cql_username=$${_CQL_USERNAME}" \
-		-var="cql_password=$${_CQL_PASSWORD}" \
+		-var="cql_username=$(CQL_USERNAME)" \
+		-var="cql_password=$(CQL_PASSWORD)" \
 		-var="port_base=$(PORT_BASE)" \
 		-var="node_private_ips=$${_NODE_IPS_JSON}"
 	echo ""
@@ -124,13 +107,18 @@ stage-03:
 
 # ─── Stage 04: PSC Endpoint Connection ───────────────────────────────
 
-.PHONY: stage-04
-stage-04:
+.PHONY: stage-04-psc-connect
+stage-04-psc-connect:
 	$(call check_var,GCP_PROJECT_ID)
+	$(call check_var,SCYLLA_VPC_NAME)
 	echo "=== Stage 04: PSC Connection ==="
+	# Discover node IPs from VPC
+	_NODE_IPS_JSON=$$(gcloud compute instances list \
+		--project="$(GCP_PROJECT_ID)" \
+		--filter="networkInterfaces[0].network ~ /$(SCYLLA_VPC_NAME)$$" \
+		--format='json(networkInterfaces[0].networkIP)' | \
+		jq -c '[.[].networkInterfaces[0].networkIP]')
 	# Read from prior stages
-	_NODE_IPS_JSON="$$(cd $(TF_DIR)/01-cluster && terraform output -json node_private_ips 2>/dev/null)" \
-		|| { echo "ERROR: Cannot read node_private_ips from stage 01."; exit 1; }
 	_SERVICE_ATTACHMENT="$$(cd $(TF_DIR)/02-producer-psc && terraform output -raw service_attachment_self_link 2>/dev/null)" \
 		|| { echo "ERROR: Cannot read service_attachment_self_link from stage 02."; exit 1; }
 	_CONSUMER_VPC_ID="$$(cd $(TF_DIR)/03-loader && terraform output -raw consumer_vpc_id 2>/dev/null)" \
@@ -152,143 +140,99 @@ stage-04:
 	echo "Port mapping:"
 	terraform output -json port_mapping | jq -r 'to_entries[] | "  \(.key) -> \(.value)"'
 
-# ─── Stage 05: Bench VM ──────────────────────────────────────────────
+# ─── Stage 05: Check DNS ─────────────────────────────────────────────
 
-.PHONY: stage-05
-stage-05:
-	$(call check_var,GCP_PROJECT_ID)
-	$(call check_var,DNS_DOMAIN)
-	echo "=== Stage 05: Bench VM ==="
-	cd $(TF_DIR)/05-bench
-	terraform init -input=false
-	terraform apply -input=false -auto-approve \
-		-var="gcp_project_id=$(GCP_PROJECT_ID)" \
-		-var="region=$(REGION)" \
-		-var="zone=$(ZONE)" \
-		-var="dns_domain=$(DNS_DOMAIN)"
-	echo ""
-	echo "Bench VM: $$(terraform output -raw bench_vm_name) ($$(terraform output -raw bench_vm_zone))"
-	echo "Test FQDN: $$(terraform output -raw test_fqdn)"
-
-# ─── Bulk Targets ─────────────────────────────────────────────────────
-
-.PHONY: deploy all stages-02-04 stages-02-05
-
-deploy all: stage-01 stage-02 stage-03 stage-04 stage-05
-
-stages-02-04: stage-02 stage-03 stage-04
-
-stages-02-05: stage-02 stage-03 stage-04 stage-05
-
-# ─── Destroy Targets ──────────────────────────────────────────────────
-
-.PHONY: destroy-05
-destroy-05:
-	$(call check_var,GCP_PROJECT_ID)
-	echo "=== Destroying Stage 05: Bench VM ==="
-	cd $(TF_DIR)/05-bench
-	if [ -d .terraform ]; then
-		terraform destroy -input=false -auto-approve \
-			-var="gcp_project_id=$(GCP_PROJECT_ID)" \
-			-var="region=$(REGION)" \
-			-var="zone=$(ZONE)" \
-			-var="dns_domain=$${DNS_DOMAIN:-placeholder}" \
-			|| echo "Stage 05 destroy failed or already clean"
-	else
-		echo "Stage 05: not initialized, skipping"
+.PHONY: stage-05-check-dns
+stage-05-check-dns:
+	echo "=== Stage 05: DNS Check ==="
+	FQDN="$(PSC_ENDPOINT_NAME).$(DNS_DOMAIN)"
+	echo "Resolving $$FQDN..."
+	RESULT=$$(dig +short A "$$FQDN")
+	if [ -z "$$RESULT" ]; then
+		echo "FAIL: $$FQDN does not resolve"
+		exit 1
 	fi
+	echo "OK: $$FQDN -> $$RESULT"
 
-.PHONY: destroy-04
-destroy-04:
+# ─── Stage 06: Check CQL ─────────────────────────────────────────────
+
+.PHONY: stage-06-check-cql
+stage-06-check-cql:
 	$(call check_var,GCP_PROJECT_ID)
-	echo "=== Destroying Stage 04: PSC Connection ==="
-	cd $(TF_DIR)/04-psc-connect
-	if [ -d .terraform ]; then
-		terraform destroy -input=false -auto-approve \
-			-var="gcp_project_id=$(GCP_PROJECT_ID)" \
-			-var="region=$(REGION)" \
-			-var="service_attachment_self_link=placeholder" \
-			-var="consumer_vpc_id=placeholder" \
-			-var="consumer_subnet_id=placeholder" \
-			-var='node_private_ips=[]' \
-			|| echo "Stage 04 destroy failed or already clean"
-	else
-		echo "Stage 04: not initialized, skipping"
-	fi
-
-.PHONY: destroy-03
-destroy-03:
-	$(call check_var,GCP_PROJECT_ID)
-	echo "=== Destroying Stage 03: Loader Infrastructure ==="
-	cd $(TF_DIR)/03-loader
-	if [ -d .terraform ]; then
-		terraform destroy -input=false -auto-approve \
-			-var="gcp_project_id=$(GCP_PROJECT_ID)" \
-			-var="region=$(REGION)" \
-			-var="zone=$(ZONE)" \
-			-var="cql_username=placeholder" \
-			-var="cql_password=placeholder" \
-			-var='node_private_ips=[]' \
-			|| echo "Stage 03 destroy failed or already clean"
-	else
-		echo "Stage 03: not initialized, skipping"
-	fi
-
-.PHONY: destroy-02
-destroy-02:
-	$(call check_var,GCP_PROJECT_ID)
-	echo "=== Destroying Stage 02: Producer PSC ==="
-	cd $(TF_DIR)/02-producer-psc
-	if [ -d .terraform ]; then
-		terraform destroy -input=false -auto-approve \
-			-var="gcp_project_id=$(GCP_PROJECT_ID)" \
-			-var="region=$(REGION)" \
-			-var="scylla_vpc_name=placeholder" \
-			-var="scylla_subnet_name=placeholder" \
-			-var='node_instances=[]' \
-			|| echo "Stage 02 destroy failed or already clean"
-	else
-		echo "Stage 02: not initialized, skipping"
-	fi
-
-.PHONY: destroy-01
-destroy-01:
-	echo "=== Destroying Stage 01: ScyllaDB Cluster ==="
-	cd $(TF_DIR)/01-cluster
-	if [ -d .terraform ]; then
-		terraform destroy -input=false -auto-approve \
-			-var="region=$(REGION)" \
-			|| echo "Stage 01 destroy failed or already clean"
-	else
-		echo "Stage 01: not initialized, skipping"
-	fi
-
-.PHONY: destroy
-destroy: destroy-05 destroy-04 destroy-03 destroy-02 destroy-01
-	echo ""
-	echo "=== Destroy complete ==="
-
-# ─── Init & Validate ──────────────────────────────────────────────────
-
-.PHONY: init
-init:
-	for stage in 01-cluster 02-producer-psc 03-loader 04-psc-connect 05-bench; do
-		echo "=== terraform init: $$stage ==="
-		(cd $(TF_DIR)/$$stage && terraform init -input=false)
+	$(call check_var,SCYLLA_VPC_NAME)
+	echo "=== Stage 06: CQL Port Check ==="
+	FQDN="$(PSC_ENDPOINT_NAME).$(DNS_DOMAIN)"
+	# Discover node count from VPC
+	NODE_COUNT=$$(gcloud compute instances list \
+		--project="$(GCP_PROJECT_ID)" \
+		--filter="networkInterfaces[0].network ~ /$(SCYLLA_VPC_NAME)$$" \
+		--format='value(name)' | wc -l)
+	echo "Found $$NODE_COUNT nodes, checking CQL ports $(CQL_PORT_BASE)..$$(($(CQL_PORT_BASE) + NODE_COUNT - 1)) on $$FQDN"
+	FAILED=0
+	for i in $$(seq 0 $$((NODE_COUNT - 1))); do
+		PORT=$$(($(CQL_PORT_BASE) + i))
+		if timeout 5 bash -c "exec 3<>/dev/tcp/$$FQDN/$$PORT" 2>/dev/null; then
+			echo "  OK:   $$FQDN:$$PORT"
+		else
+			echo "  FAIL: $$FQDN:$$PORT"
+			FAILED=1
+		fi
 	done
+	if [ "$$FAILED" -eq 1 ]; then
+		echo ""
+		echo "Some CQL ports are not reachable"
+		exit 1
+	fi
+	echo ""
+	echo "All CQL ports reachable"
 
-.PHONY: validate
-validate:
-	for stage in 01-cluster 02-producer-psc 03-loader 04-psc-connect 05-bench; do
-		echo "=== terraform validate: $$stage ==="
-		(cd $(TF_DIR)/$$stage && terraform validate)
-	done
+# ─── Stage 07: Configure ScyllaDB Client Routes ─────────────────────
 
-# ─── Run Latte Benchmark ──────────────────────────────────────────────
+.PHONY: stage-07-configure-scylla
+stage-07-configure-scylla:
+	echo "=== Stage 07: Configure ScyllaDB client routes ==="
+	FQDN="$(PSC_ENDPOINT_NAME).$(DNS_DOMAIN)"
+	echo "ScyllaDB API: $(SCYLLA_API_HOST)"
+	echo "PSC Endpoint: $$FQDN"
+	echo ""
+	# Fetch host IDs from ScyllaDB REST API
+	HOST_IDS=$$(curl -sf http://$(SCYLLA_API_HOST)/storage_service/host_id/ | jq -r '[.[].value]')
+	NODE_COUNT=$$(echo "$$HOST_IDS" | jq 'length')
+	echo "Found $$NODE_COUNT nodes"
+	echo "Host IDs: $$HOST_IDS"
+	# Build routes JSON dynamically
+	ROUTES=$$(echo "$$HOST_IDS" | jq -c --arg ep "$$FQDN" \
+		--arg cid "$(CONNECTION_ID)" \
+		--argjson cql_base $(CQL_PORT_BASE) \
+		--argjson ssl_base $(SSL_CQL_PORT_BASE) \
+		'[to_entries[] | {
+			connection_id: $$cid,
+			host_id: .value,
+			address: $$ep,
+			port: ($$cql_base + .key),
+			tls_port: ($$ssl_base + .key)
+		}]')
+	echo "Routes: $$ROUTES"
+	echo ""
+	# POST client routes
+	curl -sf -X POST \
+		-H 'Content-Type: application/json' \
+		-H 'Accept: application/json' \
+		-d "$$ROUTES" \
+		http://$(SCYLLA_API_HOST)/v2/client-routes
+	echo ""
+	echo ""
+	# Verify
+	echo "=== Current client routes ==="
+	curl -sf http://$(SCYLLA_API_HOST)/v2/client-routes | \
+		jq -c '.[] | {connection_id, host_id, address, port, tls_port}'
 
-.PHONY: run-latte
-run-latte:
+# ─── Stage 08: Run Latte Benchmark ───────────────────────────────────
+
+.PHONY: stage-08-bench
+stage-08-bench:
 	$(call check_var,GCP_PROJECT_ID)
+	echo "=== Stage 08: Run Latte Benchmark ==="
 	# Read loader VM info from stage 03
 	cd $(TF_DIR)/03-loader
 	LOADER_VM_NAME=$$(terraform output -raw loader_vm_name)
@@ -339,23 +283,121 @@ run-latte:
 		--tunnel-through-iap \
 		-- bash -c "$$REMOTE_CMD" -- "$(LATTE_DURATION)" "$(LATTE_RATE)" "$(LATTE_CONNECTIONS)"
 
-# ─── Run Scylla Bench Test ─────────────────────────────────────────────
+# ─── Bulk Targets ─────────────────────────────────────────────────────
 
-.PHONY: run-scylla-bench
-run-scylla-bench:
+.PHONY: deploy all stages-02-06 stages-02-08
+
+deploy all: stage-01-cluster stage-02-producer-psc stage-03-loader stage-04-psc-connect stage-05-check-dns stage-06-check-cql stage-07-configure-scylla stage-08-bench
+
+stages-02-06: stage-02-producer-psc stage-03-loader stage-04-psc-connect stage-05-check-dns stage-06-check-cql
+
+stages-02-08: stage-02-producer-psc stage-03-loader stage-04-psc-connect stage-05-check-dns stage-06-check-cql stage-07-configure-scylla stage-08-bench
+
+# ─── Destroy Targets ──────────────────────────────────────────────────
+# Only terraform stages (01-04, 08) have state to destroy.
+# Stages 05-07 are stateless checks.
+
+.PHONY: destroy-08-bench
+destroy-08-bench:
 	$(call check_var,GCP_PROJECT_ID)
-	cd $(TF_DIR)/05-bench
-	VM_NAME=$$(terraform output -raw bench_vm_name)
-	VM_ZONE=$$(terraform output -raw bench_vm_zone)
-	FQDN=$$(terraform output -raw test_fqdn)
-	echo "VM:   $$VM_NAME ($$VM_ZONE)"
-	echo "FQDN: $$FQDN"
+	echo "=== Destroying Stage 08: Bench VM ==="
+	cd $(TF_DIR)/08-bench
+	if [ -d .terraform ]; then
+		terraform destroy -input=false -auto-approve \
+			-var="gcp_project_id=$(GCP_PROJECT_ID)" \
+			-var="region=$(REGION)" \
+			-var="zone=$(ZONE)" \
+			-var="dns_domain=$${DNS_DOMAIN:-placeholder}" \
+			|| echo "Stage 08 destroy failed or already clean"
+	else
+		echo "Stage 08: not initialized, skipping"
+	fi
+
+.PHONY: destroy-04-psc-connect
+destroy-04-psc-connect:
+	$(call check_var,GCP_PROJECT_ID)
+	echo "=== Destroying Stage 04: PSC Connection ==="
+	cd $(TF_DIR)/04-psc-connect
+	if [ -d .terraform ]; then
+		terraform destroy -input=false -auto-approve \
+			-var="gcp_project_id=$(GCP_PROJECT_ID)" \
+			-var="region=$(REGION)" \
+			-var="service_attachment_self_link=placeholder" \
+			-var="consumer_vpc_id=placeholder" \
+			-var="consumer_subnet_id=placeholder" \
+			-var='node_private_ips=[]' \
+			|| echo "Stage 04 destroy failed or already clean"
+	else
+		echo "Stage 04: not initialized, skipping"
+	fi
+
+.PHONY: destroy-03-loader
+destroy-03-loader:
+	$(call check_var,GCP_PROJECT_ID)
+	echo "=== Destroying Stage 03: Loader Infrastructure ==="
+	cd $(TF_DIR)/03-loader
+	if [ -d .terraform ]; then
+		terraform destroy -input=false -auto-approve \
+			-var="gcp_project_id=$(GCP_PROJECT_ID)" \
+			-var="region=$(REGION)" \
+			-var="zone=$(ZONE)" \
+			-var="cql_username=placeholder" \
+			-var="cql_password=placeholder" \
+			-var='node_private_ips=[]' \
+			|| echo "Stage 03 destroy failed or already clean"
+	else
+		echo "Stage 03: not initialized, skipping"
+	fi
+
+.PHONY: destroy-02-producer-psc
+destroy-02-producer-psc:
+	$(call check_var,GCP_PROJECT_ID)
+	echo "=== Destroying Stage 02: Producer PSC ==="
+	cd $(TF_DIR)/02-producer-psc
+	if [ -d .terraform ]; then
+		terraform destroy -input=false -auto-approve \
+			-var="gcp_project_id=$(GCP_PROJECT_ID)" \
+			-var="region=$(REGION)" \
+			-var="scylla_vpc_name=placeholder" \
+			-var="scylla_subnet_name=placeholder" \
+			-var='node_instances=[]' \
+			|| echo "Stage 02 destroy failed or already clean"
+	else
+		echo "Stage 02: not initialized, skipping"
+	fi
+
+.PHONY: destroy-01-cluster
+destroy-01-cluster:
+	echo "=== Destroying Stage 01: ScyllaDB Cluster ==="
+	cd $(TF_DIR)/01-cluster
+	if [ -d .terraform ]; then
+		terraform destroy -input=false -auto-approve \
+			-var="region=$(REGION)" \
+			|| echo "Stage 01 destroy failed or already clean"
+	else
+		echo "Stage 01: not initialized, skipping"
+	fi
+
+.PHONY: destroy
+destroy: destroy-08-bench destroy-04-psc-connect destroy-03-loader destroy-02-producer-psc destroy-01-cluster
 	echo ""
-	gcloud compute ssh "$$VM_NAME" \
-		--zone="$$VM_ZONE" \
-		--project="$(GCP_PROJECT_ID)" \
-		-- -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
-		"cat /opt/bench-test.done 2>/dev/null && echo 'Startup test already ran. Re-running:' ; echo '=== DNS ===' && dig A $$FQDN +short && echo '' && echo '=== CQL ports ===' && source /opt/bench/env.sh 2>/dev/null; for p in \$$(seq 9001 9003); do timeout 3 bash -c \"exec 3<>/dev/tcp/$$FQDN/\$$p\" 2>/dev/null && echo \"$$FQDN:\$$p OPEN\" || echo \"$$FQDN:\$$p CLOSED\"; done"
+	echo "=== Destroy complete ==="
+
+# ─── Init & Validate ──────────────────────────────────────────────────
+
+.PHONY: init
+init:
+	for stage in 01-cluster 02-producer-psc 03-loader 04-psc-connect 08-bench; do
+		echo "=== terraform init: $$stage ==="
+		(cd $(TF_DIR)/$$stage && terraform init -input=false)
+	done
+
+.PHONY: validate
+validate:
+	for stage in 01-cluster 02-producer-psc 03-loader 04-psc-connect 08-bench; do
+		echo "=== terraform validate: $$stage ==="
+		(cd $(TF_DIR)/$$stage && terraform validate)
+	done
 
 # ─── Help ──────────────────────────────────────────────────────────────
 
@@ -363,42 +405,47 @@ run-scylla-bench:
 help:
 	@echo "ScyllaDB GCP Private Service Connect — Makefile Orchestration"
 	@echo ""
-	@echo "Individual stages:"
-	@echo "  make stage-01              ScyllaDB Cloud cluster (needs SCYLLA_API_TOKEN)"
-	@echo "  make stage-02              Producer PSC — NEG, ILB, Service Attachment"
-	@echo "  make stage-03              Consumer VPC + loader VM"
-	@echo "  make stage-04              PSC endpoint connection"
-	@echo "  make stage-05              Bench VM (needs DNS_DOMAIN)"
+	@echo "Stages:"
+	@echo "  make stage-01-cluster           ScyllaDB Cloud cluster"
+	@echo "  make stage-02-producer-psc      Producer PSC — NEG, ILB, Service Attachment"
+	@echo "  make stage-03-loader            Consumer VPC + loader VM"
+	@echo "  make stage-04-psc-connect       PSC endpoint connection"
+	@echo "  make stage-05-check-dns         Check DNS resolution"
+	@echo "  make stage-06-check-cql         Check CQL port connectivity"
+	@echo "  make stage-07-configure-scylla  Configure ScyllaDB client routes"
+	@echo "  make stage-08-bench             Run latte benchmark"
 	@echo ""
 	@echo "Bulk:"
-	@echo "  make deploy                All stages 01-05"
-	@echo "  make stages-02-04          Stages 02, 03, 04"
-	@echo "  make stages-02-05          Stages 02, 03, 04, 05"
+	@echo "  make deploy                     All stages 01-08"
+	@echo "  make stages-02-06               Stages 02-06 (infra + checks)"
+	@echo "  make stages-02-08               Stages 02-08 (infra + checks + configure + bench)"
 	@echo ""
 	@echo "Teardown:"
-	@echo "  make destroy               All stages in reverse"
-	@echo "  make destroy-XX            Individual stage destroy (e.g. destroy-02)"
-	@echo ""
-	@echo "Benchmarks:"
-	@echo "  make run-latte             Run latte benchmark on loader VM"
-	@echo "  make run-scylla-bench      Run connectivity test on bench VM"
+	@echo "  make destroy                    All terraform stages in reverse"
+	@echo "  make destroy-XX-name            Individual stage destroy (e.g. destroy-02-producer-psc)"
 	@echo ""
 	@echo "Helpers:"
-	@echo "  make init                  terraform init all stages"
-	@echo "  make validate              terraform validate all stages"
+	@echo "  make init                       terraform init all stages"
+	@echo "  make validate                   terraform validate all stages"
 	@echo ""
-	@echo "Variables (env or make vars):"
-	@echo "  GCP_PROJECT_ID             GCP project (required for stages 02-05)"
-	@echo "  SCYLLA_API_TOKEN           ScyllaDB Cloud API token (stage 01)"
-	@echo "  REGION                     GCP region (default: us-east1)"
-	@echo "  ZONE                       GCP zone (default: REGION-b)"
-	@echo "  CQL_PORT_BASE              Base CQL port (default: 9001)"
-	@echo "  SSL_CQL_PORT_BASE          Base SSL CQL port (default: CQL_PORT_BASE+100)"
-	@echo "  DNS_DOMAIN                 PSC DNS domain (stage 02 optional, stage 05 required)"
-	@echo "  NODE_IPS                   Comma-separated or JSON node IPs (stage 02 override)"
-	@echo "  SCYLLA_VPC_NAME            Explicit VPC name (stage 02 override)"
-	@echo "  SCYLLA_SUBNET_NAME         Explicit subnet name (stage 02 override)"
-	@echo "  NODE_INSTANCES             Explicit node instances JSON (stage 02 override)"
-	@echo "  LATTE_DURATION             Benchmark duration (default: 60s)"
-	@echo "  LATTE_RATE                 Benchmark ops/s (default: 1000)"
-	@echo "  LATTE_CONNECTIONS          Benchmark connections (default: 4)"
+	@echo "Variables (pass via env or make VAR=value):"
+	@echo ""
+	@echo "  Required:"
+	@echo "    GCP_PROJECT_ID           GCP project (stages 02-04, 06, 08)"
+	@echo "    SCYLLA_API_TOKEN         ScyllaDB Cloud API token (stage 01)"
+	@echo "    SCYLLA_VPC_NAME          ScyllaDB VPC name (stages 02-04, 06)"
+	@echo "    CQL_USERNAME             CQL username (stage 03)"
+	@echo "    CQL_PASSWORD             CQL password (stage 03)"
+	@echo ""
+	@echo "  Optional — defaults:"
+	@echo "    REGION                   GCP region                    [us-east1]"
+	@echo "    ZONE                     GCP zone                      [REGION-b]"
+	@echo "    CQL_PORT_BASE            Base CQL port                 [9001]"
+	@echo "    SSL_CQL_PORT_BASE        Base SSL CQL port             [CQL_PORT_BASE+100]"
+	@echo "    DNS_DOMAIN               GCP-verified DNS domain       [dk-test.duckdns.org]"
+	@echo "    PSC_ENDPOINT_NAME        PSC endpoint name             [scylladb-psc-endpoint]"
+	@echo "    SCYLLA_API_HOST          ScyllaDB REST API host:port   [localhost:10000]"
+	@echo "    CONNECTION_ID            Client route connection ID    [1]"
+	@echo "    LATTE_DURATION           Benchmark duration            [60s]"
+	@echo "    LATTE_RATE               Benchmark ops/s               [1000]"
+	@echo "    LATTE_CONNECTIONS        Benchmark connections          [4]"
